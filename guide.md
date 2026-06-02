@@ -384,6 +384,35 @@ sudo kubeadm init \
     ├── peer.crt / peer.key         <- etcd peer-to-peer TLS
     └── healthcheck-client.crt/key  <- etcd health check client cert
 ```
+### Certificate map: which CA signs what
+
+`kubeadm init` creates **three independent CAs**. A cert signed by one is meaningless to the others. The CA key pairs are **shared** (byte-identical) across all control planes; the leaf certs are **regenerated per node** because they carry node-specific SANs.
+
+**The three CAs — shared across all control planes, ~10-year expiry:**
+
+| CA | Files | Trust domain |
+| --- | --- | --- |
+| Cluster Root CA | `ca.crt` / `ca.key` | Kubernetes API auth (apiserver, kubelets, kubeconfigs) |
+| etcd CA | `etcd/ca.crt` / `etcd/ca.key` | etcd serving + peer + client — isolated because etcd holds all state |
+| Front-Proxy CA | `front-proxy-ca.crt` / `.key` | API aggregation layer (extension apiservers) |
+
+**Leaf certs — regenerated per node, ~1-year expiry:**
+
+| Certificate | Signed by | Role |
+| --- | --- | --- |
+| `apiserver.crt` | Root CA | apiserver TLS serving cert (SANs: LB IP, node IP, `10.96.0.1`, hostname) |
+| `apiserver-kubelet-client.crt` | Root CA | apiserver → kubelet client (logs, exec) |
+| `admin.conf`, `controller-manager.conf`, `scheduler.conf` | Root CA | component client-auth kubeconfigs |
+| kubelet client / serving certs | Root CA | node auth to apiserver (client cert auto-rotates) |
+| `apiserver-etcd-client.crt` | **etcd CA** | apiserver → etcd client — the bridge between the two trust domains |
+| `etcd/server.crt` | etcd CA | etcd serving cert |
+| `etcd/peer.crt` | etcd CA | etcd member-to-member (used when CP2's etcd joins) |
+| `etcd/healthcheck-client.crt` | etcd CA | etcd liveness probe |
+| `front-proxy-client.crt` | Front-Proxy CA | core apiserver → aggregated apiservers |
+
+> **Why `apiserver-etcd-client.crt` is signed by the etcd CA, not the Root CA:** etcd only trusts certs from its own CA. The apiserver is etcd's main client, so its etcd client cert must be signed there — that's the one place the two trust domains meet.
+
+> **HA implication:** this is why the cluster works only if all three CA key pairs are identical on both control planes — what `--upload-certs` + the certificate key deliver, and what the `sha256sum` check in [Step 10](#step-10-verify-certificates) confirms. Leaf certs differ per node but chain to the same shared CAs, so the whole cluster still trusts them. `kubeadm certs renew` re-signs only the leaves against the still-valid CAs.
 
 Key points:
 - **`--upload-certs`** encrypts and uploads CA keys to a kubeadm-certs Secret in kube-system. This allows CP2 to download them automatically during join (the secret is auto-deleted after 2 hours).
